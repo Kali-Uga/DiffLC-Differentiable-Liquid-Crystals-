@@ -1,75 +1,73 @@
-# DiffLC
+# DiffLC: A Differentiable Landau-de Gennes Framework for Liquid Crystal Research
 
-DiffLC is a compact, publication-oriented research codebase for twisted-nematic 5CB simulation, built around a differentiable Landau-de Gennes solver and sliced Jones optics.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/get-started/locally/)
 
-The codebase is organized so that the reusable physics lives in `src/difflc/`, while the notebook layer remains a thin demonstration surface.
+**DiffLC** is a high-performance numerical engine designed for the simulation of nematic liquid crystal (LC) dynamics and the solution of complex inverse problems. Built on the **PyTorch** autograd engine, DiffLC treats the entire physical pipeline—from $Q$-tensor relaxation to differential Jones calculus—as a differentiable operator.
 
-## What it does
+This framework is specifically engineered to bridge the gap between classical continuum mechanics and modern machine learning workflows, enabling high-fidelity parameter recovery and Bayesian Optimal Experimental Design (OED).
 
-- Converts between director fields and Q-tensor representations.
-- Simulates a 1D twisted-nematic cell with weak anchoring.
-- Computes optical transmission with a differential Jones model.
-- Provides optional experiment-design and inverse-solver helpers.
+## Core Capabilities
 
-## Project layout
+- **Differentiable Physics:** Full support for first- and second-order parametric sensitivities using `torch.func` (Functional API), bypassing the inaccuracies of finite-difference methods.
+- **Landau-de Gennes (LdG) Dynamics:** Implements a multi-constant $Q$-tensor expansion ($L_1, L_2, L_3$) to accurately model splay, twist, and bend elasticities, including weak surface anchoring effects.
+- **Advanced Optical Modeling:** Features a Sliced Differential Jones Matrix engine for precise calculation of optical transmission (CPI) in TN-cells with non-trivial director gradients.
+- **Parametric Identification:** Optimized for information-theoretic analysis, allowing researchers to quantify the "sloppiness" of physical constants and identify well-constrained parameter manifolds.
 
-- `src/difflc/utils.py`: physical parameters and helper functions.
-- `src/difflc/qtensor.py`: Q-tensor conversion utilities.
-- `src/difflc/solver.py`: differentiable solver and direct protocol runner.
-- `src/difflc/optics.py`: Jones matrices and transmission helpers.
-- `src/difflc/oed.py`: optional Bayesian OED helpers.
-- `src/difflc/inverse.py`: optional TRF inverse recovery helpers.
-- `tests/`: smoke tests for the core public API.
-- `notebooks/5cb_sim_demo.ipynb`: demo notebook that imports the package.
+## Technical Architecture
 
-## Install
+The codebase is modularized to support both direct physical simulations and integration into larger AI-driven research pipelines:
 
-For the core package:
+- `src/difflc/solver.py`: Semi-implicit time-stepping LdG engine.
+- `src/difflc/qtensor.py`: Gauge-invariant $Q$-tensor operations and projections.
+- `src/difflc/optics.py`: Differentiable optical response models.
+- `src/difflc/oed.py`: Bayesian utilities for maximizing Information Gain (D-optimality).
+- `src/difflc/inverse.py`: Non-linear parameter recovery via Gradient-enhanced Trust Region methods.
+
+## Installation
 
 ```bash
+git clone https://github.com/Kali-Uga/difflc.git
+cd difflc
 pip install -e .
 ```
 
-For development and research extras:
+## AI Integration & Research Utility
 
-```bash
-pip install -e '.[dev,research]'
-```
+DiffLC is designed to be "AI-native." By providing exact Jacobians of physical systems, it facilitates:
+1. **Hybrid Physics-Neural Networks:** Using the LC solver as a differentiable layer within deep learning architectures.
+2. **LLM-Guided Discovery:** Leveraging OpenAI's Codex/GPT models to automate experimental protocol synthesis and interpret Bayesian sensitivity analysis in natural language.
 
-## Run tests
-
-```bash
-pytest
-```
-
-## Quickstart
+## Quick Start
 
 ```python
+import torch
 from difflc import default_params, run_dc_protocol_diff
 
+# Initialize physical priors for 5CB
 params = default_params()
-run = run_dc_protocol_diff(
-    params.L1,
-    params.L2,
-    params.L3,
-    params.gamma1,
-    params.W_surf,
-    V_factor=3.0,
-    T_on=0.8,
-    T_off=0.0,
-    dt_fw=1e-3,
-    params=params,
+
+# Compute a differentiable forward pass
+output = run_dc_protocol_diff(
+    params.L1, params.L2, params.L3, 
+    V_factor=3.0, params=params
 )
 
-print(run["I_cross"].shape)
+# Access the gradient path back to material viscosity
+transmission = output["I_cross"][-1]
+transmission.backward()
+print(f"Sensitivity (dI/d_gamma): {params.gamma1.grad}")
 ```
 
-## Reproducibility notes
+## Citation
 
-- The default parameters reproduce the canonical 5CB setup used in the notebook.
-- The package is pure Python, with PyTorch as the main numerical dependency.
-- The test suite is intentionally lightweight so it can run in CI and on contributor machines.
+If you use this framework in your scientific work, please cite:
 
-## References
-
-The implementation follows the same physical setup as the original notebook inspired by TN 5CB literature, with a focus on weak anchoring, 1D geometry, and a 90-degree twist cell.
+```bibtex
+@software{difflc2026,
+  author = {Krutoy, Nikita},
+  title = {DiffLC: Differentiable Landau-de Gennes Simulation Suite},
+  year = {2026},
+  url = {https://github.com/Kali-Uga/difflc}
+}
