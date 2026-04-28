@@ -4,6 +4,6 @@ title: "DiffLC"
 version: "0.1.0"
 authors:
   - family-names: Nikita
-repository-code: "https://github.com/your-org/difflc"
+repository-code: "https://github.com/Kali-Uga/DiffLC-Differentiable-Liquid-Crystals-"
 license: MIT
 abstract: "Differentiable Landau-de Gennes simulation tools for twisted-nematic 5CB cells."
