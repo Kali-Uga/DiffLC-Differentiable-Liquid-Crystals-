@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use DiffLC, please cite it as a software package."
+title: "DiffLC"
+version: "0.1.0"
+authors:
+  - family-names: Nikita
+repository-code: "https://github.com/your-org/difflc"
+license: MIT
+abstract: "Differentiable Landau-de Gennes simulation tools for twisted-nematic 5CB cells."
