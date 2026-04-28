@@ -41,9 +41,8 @@ research = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/difflc"
-Repository = "https://github.com/your-org/difflc"
-Issues = "https://github.com/your-org/difflc/issues"
+Homepage = "https://github.com/Kali-Uga"
+Repository = "https://github.com/Kali-Uga/DiffLC-Differentiable-Liquid-Crystals-"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
