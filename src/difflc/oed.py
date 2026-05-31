@@ -1,97 +1,174 @@
-"""Optional OED helpers for constant-field experiment design."""
+"""Fisher Information Matrix and Optimal Experimental Design utilities.
+
+Uses JAX auto-differentiation (jacfwd) for exact Jacobians.
+Supports multi-cell joint campaigns.
+"""
 
 from __future__ import annotations
 
 import numpy as np
-import torch
-
-from .solver import run_dc_protocol_diff
-from .utils import TNParameters, default_params
 
 
-def _resolve_params(params: TNParameters | None) -> TNParameters:
-    return default_params() if params is None else params
+# ---------------------------------------------------------------------------
+# FIM computation
+# ---------------------------------------------------------------------------
 
 
-def run_single_np(param_vec, V_factor, twist_a, *, T_on=0.2, T_off=0.4, dt_fw=1e-3, params: TNParameters | None = None):
-    params = _resolve_params(params)
-    param_vec = np.asarray(param_vec, dtype=float)
-    run = run_dc_protocol_diff(
-        param_vec[0],
-        param_vec[1],
-        param_vec[2],
-        param_vec[3],
-        param_vec[4],
-        V_factor=V_factor,
-        T_on=T_on,
-        T_off=T_off,
-        dt_fw=dt_fw,
-        twist_angle=twist_a,
-        params=params,
-    )
-    return run["I_cross"].detach().cpu().numpy()
-
-
-def compute_J_fd_joint(
-    p_true,
-    Vf_planar_list,
-    Vf_twist_list,
+def compute_fim(
+    models,
+    protocols,
+    log10_p_true,
+    noise_std,
     *,
-    rel_eps=1e-3,
-    T_on=0.2,
-    T_off=0.4,
-    dt_fw=1e-3,
-    params: TNParameters | None = None,
+    dt=5e-4,
+    T_on=0.300,
+    T_off=0.200,
+    T_eq=0.100,
+    record_every=8,
+    use_jax_jac=True,
 ):
-    params = _resolve_params(params)
-    n_params = len(p_true)
+    """Compute joint Fisher Information Matrix (FIM) over all cells.
 
-    def _sensitivities(vf, twist_angle):
-        I_base = run_single_np(p_true, vf, twist_angle, T_on=T_on, T_off=T_off, dt_fw=dt_fw, params=params)
-        J = np.zeros((len(I_base), n_params))
-        for k in range(n_params):
-            p_p = np.array(p_true, dtype=float).copy()
-            p_m = np.array(p_true, dtype=float).copy()
-            p_p[k] *= (1.0 + rel_eps)
-            p_m[k] *= (1.0 - rel_eps)
-            J[:, k] = (
-                run_single_np(p_p, vf, twist_angle, T_on=T_on, T_off=T_off, dt_fw=dt_fw, params=params)
-                - run_single_np(p_m, vf, twist_angle, T_on=T_on, T_off=T_off, dt_fw=dt_fw, params=params)
-            ) / (2.0 * rel_eps * p_true[k])
-        return J
+    Parameters
+    ----------
+    models       : dict mapping protocol.name → model SimpleNamespace
+    protocols    : list of Protocol
+    log10_p_true : (5,) array — log10 of true parameters [K11,K22,K33,gamma1,W]
+    noise_std    : float — assumed measurement noise std
+    use_jax_jac  : use JAX jacfwd (True) or finite differences (False)
 
-    J_p_list = [_sensitivities(Vf, 0.0) for Vf in Vf_planar_list]
-    J_t_list = [_sensitivities(Vf, np.pi / 2) for Vf in Vf_twist_list]
-    return J_p_list, J_t_list
-
-
-def build_fim_joint(p_true, Vf_planar_list, Vf_twist_list, noise_std, *, params: TNParameters | None = None):
-    J_p_list, J_t_list = compute_J_fd_joint(p_true, Vf_planar_list, Vf_twist_list, params=params)
-    n_params = len(p_true)
+    Returns
+    -------
+    FIM : (5, 5) Fisher Information Matrix
+    J_dict : dict of Jacobians per protocol
+    """
+    n_params = len(log10_p_true)
     FIM = np.zeros((n_params, n_params))
-    for J in J_p_list:
-        FIM += (J / noise_std).T @ (J / noise_std)
-    for J in J_t_list:
-        FIM += (J / noise_std).T @ (J / noise_std)
-    return FIM
+    J_dict = {}
+
+    for p in protocols:
+        m = models[p.name]
+        V_abs = p.V_abs
+
+        if use_jax_jac:
+            J = m.jac_signal_logparams_np(
+                log10_p_true,
+                V_abs,
+                dt_=dt,
+                T_on_=T_on,
+                T_off_=T_off,
+                T_eq_=T_eq,
+                rec_=record_every,
+            )
+        else:
+            J = m.signal_jac_fd_np(
+                log10_p_true,
+                V_abs,
+                dt_=dt,
+                T_on_=T_on,
+                T_off_=T_off,
+                T_eq_=T_eq,
+                rec_=record_every,
+            )
+
+        Jw = J / noise_std
+        FIM += Jw.T @ Jw
+        J_dict[p.name] = J
+
+    return FIM, J_dict
 
 
-def evaluate_joint_design_tensor(
-    V_tensor: torch.Tensor,
-    p_true,
-    Vf_planar_count: int,
-    noise_std: float,
+def fim_diagnostics(FIM, p_true, param_names=None):
+    """Compute CRLB, correlation matrix, and D-optimality from FIM.
+
+    Returns dict with keys: crlb_pct, corr, logdet, FIM.
+    """
+    n = FIM.shape[0]
+    if param_names is None:
+        param_names = [f"p{i}" for i in range(n)]
+
+    try:
+        FIM_reg = FIM + 1e-20 * np.eye(n)
+        F_inv = np.linalg.inv(FIM_reg)
+        crlb = 100.0 * np.sqrt(np.abs(np.diag(F_inv))) / np.abs(p_true)
+    except np.linalg.LinAlgError:
+        crlb = np.full(n, np.nan)
+        F_inv = None
+
+    d_ = np.sqrt(np.diag(FIM) + 1e-30)
+    corr = FIM / np.outer(d_, d_)
+
+    sign, logdet = np.linalg.slogdet(FIM)
+    logdet = -np.inf if sign <= 0 else float(logdet)
+
+    return dict(
+        FIM=FIM,
+        corr=corr,
+        crlb_pct=crlb,
+        logdet=logdet,
+        F_inv=F_inv,
+        param_names=param_names,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Campaign runner helpers
+# ---------------------------------------------------------------------------
+
+
+def run_campaign(
+    models,
+    protocols,
+    params_K,
     *,
-    T_on=0.2,
-    T_off=0.4,
-    dt_fw=1e-3,
-    params: TNParameters | None = None,
+    noise_std=1e-2,
+    seed=42,
+    dt=5e-4,
+    T_on=0.300,
+    T_off=0.200,
+    T_eq=0.100,
+    record_every=8,
 ):
-    params = _resolve_params(params)
-    Vf_p = V_tensor[:Vf_planar_count].tolist()
-    Vf_t = V_tensor[Vf_planar_count:].tolist()
-    p_true = np.asarray(p_true, dtype=float)
-    F_norm = build_fim_joint(p_true, Vf_p, Vf_t, noise_std, params=params)
-    D_scale = np.diag(p_true)
-    F_scaled = D_scale @ F_norm @ D_scale + 1e-8 * np.eye(len(p_true))
-    return torch.tensor([np.log10(np.linalg.det(F_scaled))], dtype=torch.float64)
+    """Run forward simulation over all protocols and add noise.
+
+    Returns
+    -------
+    dict with keys:
+      clean      : list of (n_rec, n_wl, n_theta, n_pol, 3) normalised Stokes
+      noisy      : same + Gaussian noise
+      runs       : list of raw run dicts
+      target_flat: 1-D noisy concatenation (for inverse)
+      clean_flat : 1-D clean concatenation
+    """
+    rng = np.random.default_rng(seed)
+    clean = []
+    noisy = []
+    runs = []
+
+    for p in protocols:
+        m = models[p.name]
+        out = m.run_protocol_np(
+            params_K,
+            p.V_abs,
+            dt_=dt,
+            T_on_=T_on,
+            T_off_=T_off,
+            T_eq_=T_eq,
+            rec_=record_every,
+        )
+        st = out["stokes"]
+        S0_comp = st[..., 0:1]
+        sn = st[..., 1:4] / np.clip(S0_comp, 1e-30, None)
+        clean.append(sn)
+        noisy.append(sn + rng.normal(scale=noise_std, size=sn.shape))
+        runs.append(out)
+
+    return dict(
+        clean=clean,
+        noisy=noisy,
+        runs=runs,
+        target_flat=np.concatenate([x.ravel() for x in noisy]),
+        clean_flat=np.concatenate([x.ravel() for x in clean]),
+        noise_std=noise_std,
+        time_ms=runs[0]["time"] * 1e3,
+    )

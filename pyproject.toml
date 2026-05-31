@@ -4,27 +4,32 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "difflc"
-version = "0.1.0"
-description = "Differentiable Landau-de Gennes simulation tools for twisted nematic 5CB cells"
+version = "0.2.0"
+description = "Differentiable Landau-de Gennes simulation for nematic LC cells — JAX backend, full Berreman optics"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
-  { name = "Nikita" }
+  { name = "Nikita Krutoy" }
 ]
-keywords = ["liquid-crystals", "nematic", "q-tensor", "pytorch", "optics", "twisted-nematic"]
+keywords = [
+  "liquid-crystals", "nematic", "q-tensor", "jax",
+  "berreman", "optics", "twisted-nematic", "differentiable",
+]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Science/Research",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Physics",
 ]
 dependencies = [
   "numpy>=1.24",
-  "torch>=2.1",
+  "jax>=0.4.20",
+  "jaxlib>=0.4.20",
 ]
 
 [project.optional-dependencies]
@@ -35,13 +40,10 @@ dev = [
 research = [
   "matplotlib>=3.8",
   "scipy>=1.11",
-  "joblib>=1.3",
-  "gpytorch>=1.11",
-  "botorch>=0.11",
 ]
 
 [project.urls]
-Homepage = "https://github.com/Kali-Uga"
+Homepage = "https://github.com/Kali-Uga/DiffLC-Differentiable-Liquid-Crystals-"
 Repository = "https://github.com/Kali-Uga/DiffLC-Differentiable-Liquid-Crystals-"
 
 [tool.pytest.ini_options]
@@ -54,3 +56,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+exclude = ["notebooks"]

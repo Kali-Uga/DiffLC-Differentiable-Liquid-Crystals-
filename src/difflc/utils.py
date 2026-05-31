@@ -1,70 +1,237 @@
-"""Physical parameters and small helpers for TN 5CB simulations."""
+"""Physical parameters and configuration for LC simulations.
+
+Provides E7 material configuration, cell specifications, and protocol
+definitions used throughout the DiffLC framework.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+import math
+from dataclasses import dataclass
 from typing import Tuple
 
 import numpy as np
-import torch
+
+
+# ---------------------------------------------------------------------------
+# Material configuration
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class TNParameters:
-    Nz: int = 80
-    d_cell: float = 20e-6
-    L1: float = 8.037e-12
-    L2: float = 8.096e-12
-    L3: float = 6.613e-12
-    gamma1: float = 0.077
-    EPS_0: float = 8.854e-12
-    S: float = 0.533
-    deps: float = 13.0
-    ne: float = 1.736
-    no: float = 1.5442
-    wl: float = 633e-9
+class E7Config:
+    """E7 liquid crystal material and simulation parameters."""
+
+    # Spatial grid
+    Nz: int = 41
+
+    # Frank elastic constants [N]
+    K11: float = 10.64e-12
+    K22: float = 5.18e-12
+    K33: float = 16.50e-12
+
+    # Rotational viscosity [Pa·s]
+    gamma1: float = 0.2036
+
+    # Surface anchoring energy [J/m²]
+    W: float = 1.388e-4
+
+    # Equilibrium scalar order parameter
+    S0: float = 0.6
+
+    # Dielectric constants
+    eps_par: float = 19.54
+    eps_perp: float = 5.17
+
+    # Optical refractive indices (fixed over wavelength in this benchmark)
+    ne: float = 1.7287
+    no: float = 1.5182
+
+    # Landau-de Gennes thermotropic coefficients [J/m³]
+    # Convention: f_bulk = a tr(Q²) + (2b/3) tr(Q³) + (c/2) [tr(Q²)]²
+    bulk_b: float = -0.64e6
+    bulk_c: float = 0.40e6
+
+    # Boundary geometry
     pretilt_deg: float = 2.0
-    twist_deg: float = 90.0
-    W_surf: float = 5e-5
+
+    # Vacuum permittivity [F/m]
+    EPS_0: float = 8.854187817e-12
+
+    # --- Derived properties ---------------------------------------------------
 
     @property
-    def pretilt(self) -> float:
-        return float(np.deg2rad(self.pretilt_deg))
+    def deps(self) -> float:
+        """Dielectric anisotropy Δε = ε∥ − ε⊥."""
+        return self.eps_par - self.eps_perp
 
     @property
-    def twist_tot(self) -> float:
-        return float(np.deg2rad(self.twist_deg))
+    def delta_n2(self) -> float:
+        """Optical birefringence squared: Δn² = ne² − no²."""
+        return self.ne**2 - self.no**2
+
+    @property
+    def eps_iso_opt(self) -> float:
+        """Isotropic average of optical dielectric tensor."""
+        return self.no**2 + self.delta_n2 / 3.0
+
+    @property
+    def pretilt_rad(self) -> float:
+        return math.radians(self.pretilt_deg)
+
+    @property
+    def bulk_a(self) -> float:
+        """Thermotropic coefficient *a* chosen so that S0 is a stationary point:
+        3a + b·S0 + 2c·S0² = 0."""
+        return -(self.bulk_b * self.S0 + 2.0 * self.bulk_c * self.S0**2) / 3.0
+
+    @property
+    def gamma_Q(self) -> float:
+        """Q-tensor rotational viscosity (Mottram–Newton convention)."""
+        return self.gamma1 / self.S0
 
 
-DEFAULT_PARAMS = TNParameters()
+# ---------------------------------------------------------------------------
+# Cell and protocol specifications
+# ---------------------------------------------------------------------------
 
 
-def default_params() -> TNParameters:
-    return DEFAULT_PARAMS
+@dataclass(frozen=True)
+class CellSpec:
+    """Physical specification of a single LC cell."""
+
+    name: str
+    d_cell: float  # cell gap [m]
+    twist_deg: float  # total twist angle [°]
+    voltage_ratio: float  # V / V_threshold (used once to compute V_abs)
 
 
-def with_updates(params: TNParameters, **kwargs) -> TNParameters:
-    return replace(params, **kwargs)
+@dataclass(frozen=True)
+class Protocol:
+    """Fully resolved voltage protocol for a cell."""
+
+    name: str
+    cell: CellSpec
+    V_threshold_true: float
+    V_abs: float
+    E_abs: float
 
 
-def compute_K_constants(params: TNParameters) -> Tuple[float, float, float]:
-    S = params.S
-    K1 = S**2 * (2 * params.L1 + params.L2) - (2.0 / 3.0) * S**3 * params.L3
-    K2 = 2 * S**2 * params.L1 - (2.0 / 3.0) * S**3 * params.L3
-    K3 = S**2 * (2 * params.L1 + params.L2) + (4.0 / 3.0) * S**3 * params.L3
-    return K1, K2, K3
+# ---------------------------------------------------------------------------
+# Timing configuration
+# ---------------------------------------------------------------------------
 
 
-def compute_voltage_thresholds(params: TNParameters) -> Tuple[float, float]:
-    K1, K2, K3 = compute_K_constants(params)
-    V_th_planar = np.pi * np.sqrt(K1 / (params.EPS_0 * params.deps))
-    V_th_tn = np.pi * np.sqrt((K1 + (K3 - 2 * K2) / 4.0) / (params.EPS_0 * params.deps))
-    return float(V_th_planar), float(V_th_tn)
+@dataclass(frozen=True)
+class TimingConfig:
+    """Default time-stepping and recording parameters."""
+
+    dt: float = 5e-4  # solver time step [s]  (0.5 ms)
+    record_every: int = 8  # record every N solver steps  (→ 4 ms)
+    T_on: float = 0.300  # voltage-on duration [s]
+    T_off: float = 0.200  # relaxation duration [s]
+    T_eq: float = 0.100  # zero-field pre-equilibration [s]
 
 
-def build_z_axis(params: TNParameters, *, device=None, dtype=torch.float64) -> torch.Tensor:
-    return torch.linspace(0.0, params.d_cell, params.Nz, dtype=dtype, device=device)
+# ---------------------------------------------------------------------------
+# Conversion helpers
+# ---------------------------------------------------------------------------
 
 
-def as_torch_scalar(value, *, device=None, dtype=torch.float64) -> torch.Tensor:
-    return torch.as_tensor(value, dtype=dtype, device=device)
+def K_to_L(K11: float, K22: float, K33: float, S0: float) -> Tuple[float, float, float]:
+    """Convert Frank constants (K) to Landau-de Gennes elastic constants (L)."""
+    L1 = (K33 - K11 + 3.0 * K22) / (6.0 * S0**2)
+    L2 = (K11 - K22) / S0**2
+    L3 = (K33 - K11) / (2.0 * S0**3)
+    return L1, L2, L3
+
+
+def threshold_voltage(cell: CellSpec, cfg: E7Config) -> float:
+    """Analytical Fréedericksz threshold voltage for a cell."""
+    if abs(cell.twist_deg) < 1e-12:
+        K_eff = cfg.K11
+    else:
+        K_eff = cfg.K11 + 0.25 * (cfg.K33 - 2.0 * cfg.K22)
+    return math.pi * math.sqrt(K_eff / (cfg.EPS_0 * cfg.deps))
+
+
+def build_protocols(cells, cfg: E7Config):
+    """Build resolved Protocol list from CellSpec list."""
+    protocols = []
+    for cell in cells:
+        Vth = threshold_voltage(cell, cfg)
+        Vabs = cell.voltage_ratio * Vth
+        protocols.append(
+            Protocol(
+                name=f"{cell.name}_u{cell.voltage_ratio:.3g}",
+                cell=cell,
+                V_threshold_true=Vth,
+                V_abs=Vabs,
+                E_abs=Vabs / cell.d_cell,
+            )
+        )
+    return protocols
+
+
+# ---------------------------------------------------------------------------
+# Default instances
+# ---------------------------------------------------------------------------
+
+DEFAULT_CFG = E7Config()
+
+DEFAULT_CELLS = [
+    CellSpec("TN90_10um", d_cell=10e-6, twist_deg=90.0, voltage_ratio=2.19),
+    CellSpec("PLANAR0_10um", d_cell=10e-6, twist_deg=0.0, voltage_ratio=2.11),
+    CellSpec("PLANAR0_5um_FAST", d_cell=5e-6, twist_deg=0.0, voltage_ratio=1.209),
+]
+
+DEFAULT_TIMING = TimingConfig()
+
+
+def default_cfg() -> E7Config:
+    """Return the default E7 configuration."""
+    return DEFAULT_CFG
+
+
+def default_cells():
+    """Return the default three-cell campaign."""
+    return list(DEFAULT_CELLS)
+
+
+def default_timing() -> TimingConfig:
+    """Return default timing configuration."""
+    return DEFAULT_TIMING
+
+
+# ---------------------------------------------------------------------------
+# Observation grid defaults
+# ---------------------------------------------------------------------------
+
+WAVELENGTHS_NM = (450.0, 532.0, 589.0, 642.0, 700.0)
+INCIDENCE_DEG = (0.0, 35.0)
+
+
+def jones_linear(angle_deg: float):
+    """Jones vector for linearly polarized light."""
+    a = math.radians(angle_deg)
+    return np.array([math.cos(a), math.sin(a)], dtype=complex)
+
+
+def jones_circular(handedness: str = "R"):
+    """Jones vector for circularly polarized light."""
+    if handedness.upper().startswith("R"):
+        return np.array([1.0, -1.0j], dtype=complex) / math.sqrt(2)
+    return np.array([1.0, 1.0j], dtype=complex) / math.sqrt(2)
+
+
+DEFAULT_INPUT_POLS = np.array(
+    [
+        jones_linear(0.0),
+        jones_linear(45.0),
+        jones_linear(90.0),
+        jones_circular("R"),
+    ],
+    dtype=complex,
+)
+
+POL_LABELS = ("0°", "45°", "90°", "RCP")
