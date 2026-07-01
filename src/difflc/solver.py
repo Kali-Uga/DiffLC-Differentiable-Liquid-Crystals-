@@ -85,17 +85,18 @@ def _bulk_implicit_update(v_in, dt, mu, bulk_a, bulk_b, bulk_c, n_newton=5):
     """
     I5 = jnp.eye(5, dtype=jnp.float64)
 
-    def update_node(q0):
+    def update_node(q0, mu_n):
         def newton_body(_i, q):
             g = _bulk_gradient_v(q, bulk_a, bulk_b, bulk_c)
-            J = I5 + dt * mu * _bulk_gradient_jac(q, bulk_a, bulk_b, bulk_c)
-            r = q + dt * mu * g - q0
+            J = I5 + dt * mu_n * _bulk_gradient_jac(q, bulk_a, bulk_b, bulk_c)
+            r = q + dt * mu_n * g - q0
             dq = jnp.linalg.solve(J, r)
             return q - dq
 
         return lax.fori_loop(0, n_newton, newton_body, q0)
 
-    return jax.vmap(update_node)(v_in)
+    mu_arr = jnp.broadcast_to(jnp.asarray(mu, dtype=jnp.float64), (v_in.shape[0],))
+    return jax.vmap(update_node)(v_in, mu_arr)
 
 
 # ---------------------------------------------------------------------------
@@ -103,11 +104,26 @@ def _bulk_implicit_update(v_in, dt, mu, bulk_a, bulk_b, bulk_c, n_newton=5):
 # ---------------------------------------------------------------------------
 
 
-def _elastic_electric_field(Q, E, L1, L2, L3, EPS_0, deps, S0, dz):
+def _elastic_electric_field(
+    Q, E, L1, L2, L3, EPS_0, deps, S0, dz, eps_perp=0.0, d_cell=0.0, poisson=False
+):
     """Compute elastic + electric molecular field h and second derivative Qpp.
 
     Returns (h, Qpp) both shape (Nz, 3, 3).
     Boundary nodes are zeroed out via bulk_mask.
+
+    Electric term
+    -------------
+    Uniform-field model (``poisson=False``): the field passed in ``E`` is the
+    plate value V/d and the molecular field is ½ε₀(Δε/S0)E².
+
+    Fixed-voltage Poisson (``poisson=True``): the longitudinal field obeys
+    ε_zz(z)·E(z) = D = const (1-D Gauss) with ∫E dz = V, so
+        E(z) = V / (ε_zz(z) · ∫dz/ε_zz),   ε_zz = ε_perp + Δε/3 + (Δε/S0)·Q_zz.
+    The molecular field derived from the fixed-V co-energy
+    g = −½ε₀V²/∫(dz/ε_zz) keeps the SAME form ½ε₀(Δε/S0)E(z)² but with the
+    self-consistent E(z) (the non-local C_inv dependence is captured exactly by
+    E(z)). ``E`` is still passed as V/d, so V is recovered as E·d_cell.
     """
     Nz = Q.shape[0]
     zero = jnp.zeros((1, 3, 3), dtype=jnp.float64)
@@ -142,7 +158,16 @@ def _elastic_electric_field(Q, E, L1, L2, L3, EPS_0, deps, S0, dz):
     h_L3 = L3 * Q33 * Qpp + L3 * Q33p * Qp
     h_L3_corr = -0.5 * L3 * gsq * mask_33
 
-    h_E = 0.5 * EPS_0 * (deps / S0) * E**2 * mask_33
+    if poisson:
+        V = E * d_cell  # E was passed as the plate value V/d
+        eps_bar = eps_perp + deps / 3.0
+        eps_zz = jnp.clip(eps_bar + (deps / S0) * Q[:, 2, 2], 1e-3, None)  # (Nz,)
+        C_inv = jnp.sum(dz / eps_zz)                      # ∫ dz/ε_zz
+        E_field = V / (C_inv * eps_zz)                    # E(z), ∫E dz = V
+        E2 = (E_field**2)[:, None, None]
+    else:
+        E2 = E**2
+    h_E = 0.5 * EPS_0 * (deps / S0) * E2 * mask_33
 
     bulk_mask = jnp.ones((Nz, 1, 1), dtype=jnp.float64).at[0].set(0.0).at[-1].set(0.0)
     h = (h_L1 + h_L2 + h_L3 + h_L3_corr + h_E) * bulk_mask
@@ -157,20 +182,23 @@ def _elastic_electric_field(Q, E, L1, L2, L3, EPS_0, deps, S0, dz):
 def _tridiagonal_coefficients(dt, L1, gamma_Q, W, dz, Nz):
     """Build tridiagonal system coefficients for implicit L1 + anchoring.
 
-    Returns (lower, diag, upper, c_w) all as 1-D JAX arrays.
+    ``gamma_Q`` (Q-tensor mobility μ = S0/γ1) may be a scalar OR a per-node
+    (Nz,) array — the latter is used for backflow, where the effective
+    rotational viscosity is angle-dependent. A scalar reproduces the original
+    uniform coefficients bit-for-bit. Returns (lower, diag, upper, c_w).
     """
-    c_el = dt * gamma_Q * L1 / dz**2
-    c_w = dt * gamma_Q * W / (0.5 * dz)
+    gq = jnp.broadcast_to(jnp.asarray(gamma_Q, dtype=jnp.float64), (Nz,))
+    c_el = dt * gq * L1 / dz**2          # (Nz,)
+    c_w = dt * gq * W / (0.5 * dz)       # (Nz,) — only [0],[-1] used at anchors
 
-    diag = jnp.ones((Nz,), dtype=jnp.float64) * (1.0 + 2.0 * c_el)
-    diag = diag.at[0].set(1.0 + c_w + 2.0 * c_el)
-    diag = diag.at[-1].set(1.0 + c_w + 2.0 * c_el)
+    diag = 1.0 + 2.0 * c_el
+    diag = diag.at[0].set(1.0 + c_w[0] + 2.0 * c_el[0])
+    diag = diag.at[-1].set(1.0 + c_w[-1] + 2.0 * c_el[-1])
 
-    lower = jnp.ones((Nz - 1,), dtype=jnp.float64) * (-c_el)
-    upper = jnp.ones((Nz - 1,), dtype=jnp.float64) * (-c_el)
-    # Ghost-node mirroring at boundaries
-    upper = upper.at[0].set(-2.0 * c_el)
-    lower = lower.at[-1].set(-2.0 * c_el)
+    upper = -c_el[:-1]                   # row i, coeff of v_{i+1} = -c_el_i
+    lower = -c_el[1:]                    # row i, coeff of v_{i-1} = -c_el_i
+    upper = upper.at[0].set(-2.0 * c_el[0])
+    lower = lower.at[-1].set(-2.0 * c_el[-1])
 
     return lower, diag, upper, c_w
 
@@ -236,6 +264,10 @@ def _step(
     bulk_a,
     bulk_b,
     bulk_c,
+    eps_perp=0.0,
+    d_cell=0.0,
+    poisson=False,
+    backflow_kappa=0.0,
 ):
     """One semi-implicit time step.
 
@@ -246,20 +278,39 @@ def _step(
     """
     K11, K22, K33, gamma1, W = params_K
     L1, L2, L3 = K_to_L(K11, K22, K33, S0)
-    mu = S0 / gamma1  # Q-tensor mobility = 1/γ_Q
+    mu0 = S0 / gamma1  # Q-tensor mobility = 1/γ_Q
 
     Q = v2Q(v)
-    h_el, Qpp = _elastic_electric_field(Q, E, L1, L2, L3, EPS_0, deps, S0, dz)
+
+    # Backflow: angle-dependent effective rotational viscosity (1-D Ericksen–
+    # Leslie reduction). γ1_eff = γ1·(1 − κ·sin²2θ) ⇒ μ(θ) = μ0/(1 − κ·sin²2θ).
+    # Larger at high tilt / fast reorientation (early relaxation), ≈μ0 at small
+    # tilt (tail). For uniaxial Q: sin²θ = Q_zz/S0 + 1/3. κ=0 → original solver.
+    if backflow_kappa > 0.0:
+        Nz_ = v.shape[0]
+        s = jnp.clip(Q[:, 2, 2] / S0 + 1.0 / 3.0, 0.0, 1.0)
+        f = 4.0 * s * (1.0 - s)
+        mu_node = mu0 / jnp.clip(1.0 - backflow_kappa * f, 0.1, None)
+        lower, diag, upper, c_w = _tridiagonal_coefficients(dt, L1, mu_node, W, dz, Nz_)
+        mu_expl = mu_node[:, None]
+        mu_bulk = mu_node
+    else:
+        mu_expl = mu0
+        mu_bulk = mu0
+
+    h_el, Qpp = _elastic_electric_field(
+        Q, E, L1, L2, L3, EPS_0, deps, S0, dz, eps_perp, d_cell, poisson
+    )
     # Explicit part excludes L1 (handled implicitly in Thomas)
     h_explicit = proj_ST(h_el) - proj_ST(L1 * Qpp)
-    rhs_full = v + dt * mu * Q2v(h_explicit)
+    rhs_full = v + dt * mu_expl * Q2v(h_explicit)
 
-    # Anchor boundary nodes
-    rhs = rhs_full.at[0].set(v[0] + c_w * qsb_v)
-    rhs = rhs.at[-1].set(v[-1] + c_w * qst_v)
+    # Anchor boundary nodes (c_w is per-node; boundary values used)
+    rhs = rhs_full.at[0].set(v[0] + c_w[0] * qsb_v)
+    rhs = rhs.at[-1].set(v[-1] + c_w[-1] * qst_v)
 
     v_elastic = _solve_tridiagonal(lower, diag, upper, rhs)
-    return _bulk_implicit_update(v_elastic, dt, mu, bulk_a, bulk_b, bulk_c)
+    return _bulk_implicit_update(v_elastic, dt, mu_bulk, bulk_a, bulk_b, bulk_c)
 
 
 # ---------------------------------------------------------------------------
@@ -279,8 +330,15 @@ def make_model(
     T_on=0.300,
     T_off=0.200,
     T_eq=0.100,
+    poisson=False,
+    backflow_kappa=0.0,
 ):
     """Build a JAX model namespace for a single LC cell.
+
+    ``poisson=False`` (default) uses a uniform longitudinal field E=V/d.
+    ``poisson=True`` solves the 1-D fixed-voltage electrostatics ε_zz(z)E(z)=const
+    so the field redistributes as the director tilts (matters when Δε/ε⊥ is not
+    small); see ``_elastic_electric_field``.
 
     Returns a SimpleNamespace with:
     - ``run_protocol_np``      — forward simulation → dict of numpy arrays
@@ -320,6 +378,7 @@ def make_model(
     bulk_c = cfg.bulk_c
     EPS_0 = cfg.EPS_0
     deps = cfg.deps
+    eps_perp = cfg.eps_perp
     no = cfg.no
     ne = cfg.ne
 
@@ -330,15 +389,16 @@ def make_model(
 
     # --- step helpers (these capture material constants) ---
 
-    def _v0_init():
-        theta0 = jnp.full((Nz,), cfg.pretilt_rad, dtype=jnp.float64)
+    def _v0_init(pretilt_rad):
+        theta0 = jnp.full((Nz,), pretilt_rad, dtype=jnp.float64)
         phi0 = (z_axis / d_cell) * math.radians(cell.twist_deg)
         return Q2v(ang2Q(theta0, phi0, S_val=S0))
 
-    def _boundary_vectors():
+    def _boundary_vectors(pretilt_rad):
         twist_rad = math.radians(cell.twist_deg)
-        Qsb = ang2Q(jnp.array([cfg.pretilt_rad]), jnp.array([0.0]), S_val=S0)[0]
-        Qst = ang2Q(jnp.array([cfg.pretilt_rad]), jnp.array([twist_rad]), S_val=S0)[0]
+        pt = jnp.asarray(pretilt_rad, dtype=jnp.float64)
+        Qsb = ang2Q(pt[None], jnp.array([0.0]), S_val=S0)[0]
+        Qst = ang2Q(pt[None], jnp.array([twist_rad]), S_val=S0)[0]
         return Q2v(Qsb), Q2v(Qst)
 
     def _make_tridiag(dt_val, params_K):
@@ -366,6 +426,10 @@ def make_model(
             bulk_a,
             bulk_b,
             bulk_c,
+            eps_perp,
+            d_cell,
+            poisson,
+            backflow_kappa,
         )
 
     def _all_stokes_fn(Q_field):
@@ -374,11 +438,11 @@ def make_model(
     # --- inner protocol (JAX-purefunction, JIT-able) ---
 
     def _protocol_recorded(
-        params_K, V_abs, dt_val, n_on_blocks, n_off_blocks, n_eq, rec_every
+        params_K, V_abs, dt_val, n_on_blocks, n_off_blocks, n_eq, rec_every, pretilt_rad
     ):
         lower, diag, upper, c_w = _make_tridiag(dt_val, params_K)
-        qsb_v, qst_v = _boundary_vectors()
-        v = _v0_init()
+        qsb_v, qst_v = _boundary_vectors(pretilt_rad)
+        v = _v0_init(pretilt_rad)
 
         # Pre-equilibration at zero field
         def eq_step(v_curr, _):
@@ -412,11 +476,11 @@ def make_model(
         time_axis = (jnp.arange(n_rec, dtype=jnp.float64) + 1.0) * dt_val * rec_every
         return time_axis, stokes, diag_out, states
 
-    def _protocol_waveform(params_K, V_blocks_abs, dt_val, n_eq, rec_every):
+    def _protocol_waveform(params_K, V_blocks_abs, dt_val, n_eq, rec_every, pretilt_rad):
         """Arbitrary block-wise voltage waveform."""
         lower, diag, upper, c_w = _make_tridiag(dt_val, params_K)
-        qsb_v, qst_v = _boundary_vectors()
-        v = _v0_init()
+        qsb_v, qst_v = _boundary_vectors(pretilt_rad)
+        v = _v0_init(pretilt_rad)
 
         def eq_step(v_curr, _):
             return _step_fn(
@@ -446,7 +510,7 @@ def make_model(
         return time_axis, stokes, diag_out, states
 
     def _signal_logparams(
-        log10_params, V_abs, dt_val, n_on_blocks, n_off_blocks, n_eq, rec_every
+        log10_params, V_abs, dt_val, n_on_blocks, n_off_blocks, n_eq, rec_every, pretilt_rad
     ):
         """Normalised Stokes (S1/S0, S2/S0, S3/S0) as a flat 1-D array."""
         params_K = 10.0**log10_params
@@ -458,6 +522,7 @@ def make_model(
             n_off_blocks,
             n_eq,
             rec_every,
+            pretilt_rad,
         )
         S0_comp = stokes[..., 0:1]
         Sn = stokes[..., 1:4] / jnp.clip(S0_comp, 1e-30, None)
@@ -492,6 +557,32 @@ def make_model(
 
     # --- numpy-friendly wrappers ---
     import numpy as np
+    import warnings as _warnings
+
+    def _stability_warn(params_K, dt_):
+        """Warn if dt exceeds the explicit-stability limit of the L2/L3 terms.
+
+        L1 + anchoring are integrated implicitly (Thomas), but L2 and L3 (the
+        latter carries the bend constant K33) are explicit, so the scheme is
+        only conditionally stable: dt ≲ dz² / (μ · max|L2, L3|). Refining the
+        spatial grid (larger Nz, smaller dz) tightens this limit; exceeding it
+        silently produces NaN / blow-up. This guard makes that condition visible.
+        """
+        K11, K22, K33, gamma1, W = [float(x) for x in params_K]
+        _, L2, L3 = K_to_L(K11, K22, K33, S0)
+        mu = S0 / gamma1
+        Leff = max(abs(L2), abs(L3))
+        if Leff > 0.0:
+            dt_max = dz**2 / (mu * Leff)
+            if dt_ > dt_max:
+                _warnings.warn(
+                    f"dt={dt_:.2e}s exceeds explicit-stability limit "
+                    f"~{dt_max:.2e}s (Nz={Nz}, dz={dz:.2e}m): L2/L3 are explicit, "
+                    f"so a larger dt risks NaN/blow-up. Reduce dt or Nz "
+                    f"(or refine both together).",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
     def run_protocol_np(
         params_K,
@@ -502,7 +593,9 @@ def make_model(
         T_off_=T_off,
         T_eq_=T_eq,
         rec_=record_every,
+        pretilt_deg=cfg.pretilt_deg,
     ):
+        _stability_warn(params_K, float(dt_))
         n_on_b, n_off_b, n_eq_ = counts(T_on_, T_off_, dt_, T_eq_, rec_)
         t, st, diag_out, states = _protocol_jit(
             jnp.asarray(params_K, dtype=jnp.float64),
@@ -512,6 +605,7 @@ def make_model(
             n_off_b,
             n_eq_,
             int(rec_),
+            float(math.radians(pretilt_deg)),
         )
         return {
             "time": np.asarray(t),
@@ -524,7 +618,8 @@ def make_model(
         }
 
     def run_waveform_np(
-        params_K, V_blocks_abs, *, dt_=dt, T_eq_=T_eq, rec_=record_every
+        params_K, V_blocks_abs, *, dt_=dt, T_eq_=T_eq, rec_=record_every,
+        pretilt_deg=cfg.pretilt_deg,
     ):
         n_eq_ = int(round(T_eq_ / dt_))
         t, st, diag_out, states = _waveform_jit(
@@ -533,6 +628,7 @@ def make_model(
             float(dt_),
             n_eq_,
             int(rec_),
+            float(math.radians(pretilt_deg)),
         )
         return {
             "time": np.asarray(t),
@@ -554,6 +650,7 @@ def make_model(
         T_off_=T_off,
         T_eq_=T_eq,
         rec_=record_every,
+        pretilt_deg=cfg.pretilt_deg,
     ):
         n_on_b, n_off_b, n_eq_ = counts(T_on_, T_off_, dt_, T_eq_, rec_)
         out = _signal_jit(
@@ -564,6 +661,7 @@ def make_model(
             n_off_b,
             n_eq_,
             int(rec_),
+            float(math.radians(pretilt_deg)),
         )
         return np.asarray(out)
 
@@ -576,6 +674,7 @@ def make_model(
         T_off_=T_off,
         T_eq_=T_eq,
         rec_=record_every,
+        pretilt_deg=cfg.pretilt_deg,
     ):
         n_on_b, n_off_b, n_eq_ = counts(T_on_, T_off_, dt_, T_eq_, rec_)
         out = _jac_signal_jit(
@@ -586,6 +685,7 @@ def make_model(
             n_off_b,
             n_eq_,
             int(rec_),
+            float(math.radians(pretilt_deg)),
         )
         return np.asarray(out)
 
