@@ -16,3 +16,8 @@ venv/
 env/
 .idea/
 .vscode/
+
+# R&D local artefacts (not for publication)
+_rnd_backups/
+RnD_optics_log.md
+*.pkl
