@@ -78,35 +78,63 @@ def compute_fim(
     return FIM, J_dict
 
 
-def fim_diagnostics(FIM, p_true, param_names=None):
-    """Compute CRLB, correlation matrix, and D-optimality from FIM.
+def fim_diagnostics(FIM, p_true=None, param_names=None):
+    """Compute CRLB, parameter correlation, and D-optimality from a FIM.
 
-    Returns dict with keys: crlb_pct, corr, logdet, FIM.
+    IMPORTANT — units. The FIM is built from the Jacobian of the signal w.r.t.
+    **log10 parameters** (see ``compute_fim`` → ``jac_signal_logparams_np``).
+    Hence ``diag(F_inv)`` are variances in *decades²*, and ``sqrt`` gives the
+    standard deviation of ``log10(p)``, i.e. σ_log. The relative (percent)
+    uncertainty of the *linear* parameter is therefore
+
+        rel% = 100 · (10**σ_log − 1)          (exact, multiplicative)
+             ≈ 100 · ln(10) · σ_log            (small-σ limit)
+
+    The previous implementation divided σ_log by the linear ``p_true`` — mixing
+    decades with newtons — which is dimensionally meaningless. ``p_true`` is no
+    longer required (relative error is intrinsic to the log parametrisation);
+    it is kept only for backward-compatible call signatures.
+
+    The parameter **correlation** matrix is the normalised **covariance**
+    (F_inv), not the normalised FIM — these differ for ill-conditioned FIMs.
+
+    Returns dict: crlb_pct, sigma_log, corr (from cov), corr_fim (legacy),
+    logdet, FIM, F_inv, cond, param_names.
     """
     n = FIM.shape[0]
     if param_names is None:
         param_names = [f"p{i}" for i in range(n)]
 
+    # Regularise relative to the FIM scale (trace/n), not by an absolute 1e-20.
+    scale = float(np.trace(FIM)) / n if np.trace(FIM) > 0 else 1.0
     try:
-        FIM_reg = FIM + 1e-20 * np.eye(n)
-        F_inv = np.linalg.inv(FIM_reg)
-        crlb = 100.0 * np.sqrt(np.abs(np.diag(F_inv))) / np.abs(p_true)
+        F_inv = np.linalg.inv(FIM + 1e-12 * scale * np.eye(n))
+        sigma_log = np.sqrt(np.abs(np.diag(F_inv)))
+        crlb_pct = 100.0 * (10.0**sigma_log - 1.0)  # relative error of linear param
+        d_cov = np.sqrt(np.abs(np.diag(F_inv)))
+        corr = F_inv / np.outer(d_cov, d_cov)        # correlation of estimates
     except np.linalg.LinAlgError:
-        crlb = np.full(n, np.nan)
         F_inv = None
+        sigma_log = np.full(n, np.nan)
+        crlb_pct = np.full(n, np.nan)
+        corr = np.full((n, n), np.nan)
 
-    d_ = np.sqrt(np.diag(FIM) + 1e-30)
-    corr = FIM / np.outer(d_, d_)
+    d_fim = np.sqrt(np.abs(np.diag(FIM)) + 1e-30)
+    corr_fim = FIM / np.outer(d_fim, d_fim)          # legacy (normalised FIM)
 
     sign, logdet = np.linalg.slogdet(FIM)
     logdet = -np.inf if sign <= 0 else float(logdet)
+    cond = float(np.linalg.cond(FIM))
 
     return dict(
         FIM=FIM,
-        corr=corr,
-        crlb_pct=crlb,
-        logdet=logdet,
         F_inv=F_inv,
+        sigma_log=sigma_log,
+        crlb_pct=crlb_pct,
+        corr=corr,
+        corr_fim=corr_fim,
+        logdet=logdet,
+        cond=cond,
         param_names=param_names,
     )
 
