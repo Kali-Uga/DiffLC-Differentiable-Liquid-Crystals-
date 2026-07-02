@@ -87,8 +87,16 @@ class E7Config:
 
     @property
     def gamma_Q(self) -> float:
-        """Q-tensor rotational viscosity (Mottram–Newton convention)."""
-        return self.gamma1 / self.S0
+        """Q-tensor rotational viscosity γ_Q = γ1 / (2 S0²).
+
+        For a uniaxial Q = S(nn − I/3) with fixed S, |Q̇|² = 2S²|ṅ|², so
+        equating the Q-dissipation ½γ_Q|Q̇|² to the director dissipation
+        ½γ1|ṅ|² gives γ_Q = γ1/(2S²). The corresponding mobility used in the
+        solver is μ = 1/γ_Q = 2S0²/γ1. (The earlier γ1/S0 was too large by a
+        factor 2S0, making the dynamics 2S0≈1.2× too slow at S0=0.6 and giving
+        recovered γ1 a spurious ∝1/S0 dependence.) Consistent with the anchoring
+        conversion W_Q = W_RP/(2S0²)."""
+        return self.gamma1 / (2.0 * self.S0**2)
 
 
 # ---------------------------------------------------------------------------

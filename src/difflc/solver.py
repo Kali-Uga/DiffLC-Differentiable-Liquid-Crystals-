@@ -162,7 +162,13 @@ def _elastic_electric_field(
         V = E * d_cell  # E was passed as the plate value V/d
         eps_bar = eps_perp + deps / 3.0
         eps_zz = jnp.clip(eps_bar + (deps / S0) * Q[:, 2, 2], 1e-3, None)  # (Nz,)
-        C_inv = jnp.sum(dz / eps_zz)                      # ∫ dz/ε_zz
+        inv = 1.0 / eps_zz
+        # Trapezoidal ∫dz/ε_zz over the Nz nodes spanning [0, d]=(Nz-1)·dz.
+        # (The former rectangular jnp.sum(dz·inv) integrated an extra half-cell
+        # at each end → effective thickness d+dz, giving E = V/(d+dz) and an
+        # O(1/Nz) field deficit; trapezoid recovers E = V/d exactly for uniform
+        # ε_zz.)
+        C_inv = dz * (jnp.sum(inv) - 0.5 * inv[0] - 0.5 * inv[-1])   # ∫ dz/ε_zz
         E_field = V / (C_inv * eps_zz)                    # E(z), ∫E dz = V
         E2 = (E_field**2)[:, None, None]
     else:
@@ -182,7 +188,8 @@ def _elastic_electric_field(
 def _tridiagonal_coefficients(dt, L1, gamma_Q, W, dz, Nz):
     """Build tridiagonal system coefficients for implicit L1 + anchoring.
 
-    ``gamma_Q`` (Q-tensor mobility μ = S0/γ1) may be a scalar OR a per-node
+    ``gamma_Q`` here is the Q-tensor **mobility** μ = 1/γ_Q = 2S0²/γ1 (the name
+    is historical). It may be a scalar OR a per-node
     (Nz,) array — the latter is used for backflow, where the effective
     rotational viscosity is angle-dependent. A scalar reproduces the original
     uniform coefficients bit-for-bit. Returns (lower, diag, upper, c_w).
@@ -278,14 +285,19 @@ def _step(
     """
     K11, K22, K33, gamma1, W = params_K
     L1, L2, L3 = K_to_L(K11, K22, K33, S0)
-    mu0 = S0 / gamma1  # Q-tensor mobility = 1/γ_Q
+    mu0 = 2.0 * S0**2 / gamma1  # Q-tensor mobility 1/γ_Q, γ_Q = γ1/(2S0²)
 
     Q = v2Q(v)
 
-    # Backflow: angle-dependent effective rotational viscosity (1-D Ericksen–
-    # Leslie reduction). γ1_eff = γ1·(1 − κ·sin²2θ) ⇒ μ(θ) = μ0/(1 − κ·sin²2θ).
-    # Larger at high tilt / fast reorientation (early relaxation), ≈μ0 at small
-    # tilt (tail). For uniaxial Q: sin²θ = Q_zz/S0 + 1/3. κ=0 → original solver.
+    # Backflow (phenomenological): a tilt-dependent effective rotational
+    # viscosity μ(θ) = μ0/(1 − κ·sin²2θ) with one fitted κ. NOTE: this is a
+    # single-mode surrogate, NOT the true 1-D Ericksen–Leslie reduction
+    # γ_eff(θ) = γ1 − (α3cos²θ − α2sin²θ)²/(η_b cos²θ + η_c sin²θ + …), which is
+    # monotonic and maximal at θ→90° (homeotropic). The sin²2θ form vanishes at
+    # θ=90°, so κ is a data-fitted knob and does NOT map onto Leslie coefficients.
+    # For uniaxial Q: sin²θ = Q_zz/S0 + 1/3. κ=0 → original solver.
+    # It scales only the director (rotational) dynamics — the L1/L2/L3/E torque —
+    # NOT the scalar-order (bulk thermotropic) relaxation, which keeps μ0.
     if backflow_kappa > 0.0:
         Nz_ = v.shape[0]
         s = jnp.clip(Q[:, 2, 2] / S0 + 1.0 / 3.0, 0.0, 1.0)
@@ -293,7 +305,7 @@ def _step(
         mu_node = mu0 / jnp.clip(1.0 - backflow_kappa * f, 0.1, None)
         lower, diag, upper, c_w = _tridiagonal_coefficients(dt, L1, mu_node, W, dz, Nz_)
         mu_expl = mu_node[:, None]
-        mu_bulk = mu_node
+        mu_bulk = mu0        # backflow must not touch scalar-order (S) relaxation
     else:
         mu_expl = mu0
         mu_bulk = mu0
@@ -332,6 +344,7 @@ def make_model(
     T_eq=0.100,
     poisson=False,
     backflow_kappa=0.0,
+    n_ambient=1.0,
 ):
     """Build a JAX model namespace for a single LC cell.
 
@@ -404,7 +417,7 @@ def make_model(
     def _make_tridiag(dt_val, params_K):
         K11, K22, K33, gamma1, W = params_K
         L1, _, _ = K_to_L(K11, K22, K33, S0)
-        mu = S0 / gamma1
+        mu = 2.0 * S0**2 / gamma1  # 1/γ_Q, γ_Q = γ1/(2S0²)
         return _tridiagonal_coefficients(dt_val, L1, mu, W, dz, Nz)
 
     def _step_fn(v, lower, diag, upper, c_w, dt_val, E, params_K, qsb_v, qst_v):
@@ -433,7 +446,10 @@ def make_model(
         )
 
     def _all_stokes_fn(Q_field):
-        return all_stokes(Q_field, _wls_m, _thetas, _pols, dz, no=no, ne=ne, S0=S0)
+        return all_stokes(
+            Q_field, _wls_m, _thetas, _pols, dz, no=no, ne=ne, S0=S0,
+            n_ambient=n_ambient,
+        )
 
     # --- inner protocol (JAX-purefunction, JIT-able) ---
 
@@ -570,7 +586,7 @@ def make_model(
         """
         K11, K22, K33, gamma1, W = [float(x) for x in params_K]
         _, L2, L3 = K_to_L(K11, K22, K33, S0)
-        mu = S0 / gamma1
+        mu = 2.0 * S0**2 / gamma1  # 1/γ_Q, γ_Q = γ1/(2S0²)
         Leff = max(abs(L2), abs(L3))
         if Leff > 0.0:
             dt_max = dz**2 / (mu * Leff)
