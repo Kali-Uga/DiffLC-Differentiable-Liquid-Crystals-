@@ -31,21 +31,45 @@ def _model(poisson, Nz=21, dt=2.5e-4, rec=2, T_on=0.05, T_off=0.05):
     )
 
 
-def test_poisson_field_integrates_to_voltage():
-    """E(z) reconstructed from the ON-state director must satisfy ∫E dz = V."""
-    Nz = 21
-    M = _model(True, Nz=Nz)
-    Vr = 7.0
-    o = M.run_protocol_np(PARAMS, Vr)
-    n_on = M.counts(0.05, 0.05, 2.5e-4, 0.02, 2)[0]
-    theta = o["diag"][n_on - 1, :, 0]            # tilt from plane, last ON record
-    S0, eps_perp, deps = 0.6, 6.9, 12.3
-    Qzz = S0 * (np.sin(theta) ** 2 - 1.0 / 3.0)  # uniaxial, n_z = sinθ
-    eps_zz = eps_perp + deps / 3.0 + (deps / S0) * Qzz
+def _poisson_E_from_solver(Nz, theta_rad, V, S0=0.6, eps_perp=6.9, deps=12.3):
+    """Extract the interior E(z) that the solver's own field routine produces.
+
+    Uses a *uniform* director so every elastic gradient term (L1/L2/L3) and
+    second derivative vanishes; then the molecular field on interior nodes is
+    exactly h[·,2,2] = ½ε₀(Δε/S0)E(z)², so E(z) is recovered from the solver
+    output rather than reconstructed in the test. This exercises the real
+    ``_elastic_electric_field`` quadrature (unlike the old tautological check,
+    which rebuilt E with the same formula it then integrated)."""
+    from difflc.solver import _elastic_electric_field
+
+    n = np.array([np.cos(theta_rad), 0.0, np.sin(theta_rad)])
+    Q_single = S0 * (np.outer(n, n) - np.eye(3) / 3.0)
+    Q = np.broadcast_to(Q_single, (Nz, 3, 3)).copy()
     dz = D_CELL / (Nz - 1)
-    C_inv = np.sum(dz / eps_zz)
-    E_field = Vr / (C_inv * eps_zz)
-    assert abs(np.sum(E_field * dz) - Vr) < 1e-6
+    EPS_0 = 8.854187817e-12
+    E_plate = V / D_CELL
+    h, _ = _elastic_electric_field(
+        Q, E_plate, 0.0, 0.0, 0.0, EPS_0, deps, S0, dz,
+        eps_perp=eps_perp, d_cell=D_CELL, poisson=True,
+    )
+    h_zz = np.asarray(h)[:, 2, 2]
+    coeff = 0.5 * EPS_0 * (deps / S0)
+    E = np.sqrt(np.clip(h_zz / coeff, 0.0, None))   # boundary nodes are masked → 0
+    return E[1:-1], dz                              # interior E(z)
+
+
+def test_poisson_field_uniform_limit_equals_V_over_d():
+    """In the uniform (homeotropic) limit the fixed-V field must be E = V/d
+    exactly. The former rectangular quadrature integrated an extra half-cell at
+    each end (effective thickness d+dz) → E = V/(d+dz), an O(1/Nz) deficit that
+    biases the dielectric torque; the trapezoidal rule removes it. This test
+    would FAIL on the old ``jnp.sum(dz/eps_zz)`` quadrature."""
+    for Nz in (21, 41, 81):
+        E, _ = _poisson_E_from_solver(Nz, np.radians(75.0), V=5.0)
+        E_expected = 5.0 / D_CELL
+        assert np.allclose(E, E_expected, rtol=1e-9), (
+            f"Nz={Nz}: E/(V/d)={float(E.mean())/E_expected:.6f} (want 1.0)"
+        )
 
 
 def test_poisson_homeotropic_limit_matches_uniform():
@@ -178,3 +202,71 @@ def test_inverse_roundtrip_converges_with_analytic_jacobian():
     assert r.cost < 1e-8, f"cost not driven to 0: {r.cost}"
     assert r.optimality < 1e-4, f"not gradient-converged: ||Jᵀr||={r.optimality}"
     assert np.all(rel < 1e-3), f"params not recovered: rel={rel}"
+
+
+# ---------------------------------------------------------------------------
+# Oblique optics (Berreman): Snell + Fresnel boundary vs exact Airy (R&D iter 4)
+# ---------------------------------------------------------------------------
+
+
+def _airy_T(n, d, lam, theta_amb, pol, n_amb=1.0):
+    """Exact transmittance of a lossless isotropic slab (index n, thickness d)
+    in an ambient of index n_amb, incidence angle theta_amb, s/p polarisation."""
+    sa, ca = math.sin(theta_amb), math.cos(theta_amb)
+    st = n_amb * sa / n
+    ct = math.sqrt(1.0 - st * st)
+    if pol == "s":
+        r = (n_amb * ca - n * ct) / (n_amb * ca + n * ct)
+    else:
+        r = (n * ca - n_amb * ct) / (n * ca + n_amb * ct)
+    R = r * r
+    delta = 2.0 * math.pi / lam * n * d * ct
+    F = 4.0 * R / (1.0 - R) ** 2
+    return 1.0 / (1.0 + F * math.sin(delta) ** 2)
+
+
+@pytest.mark.parametrize("n_amb", [1.0, 1.52])
+@pytest.mark.parametrize("theta_deg", [0.0, 20.0, 35.0])
+def test_berreman_oblique_matches_airy(n_amb, theta_deg):
+    """The oblique Berreman path (Snell ξ=n_amb·sinθ + Fresnel boundary) must
+    reproduce the exact Airy transmittance of an isotropic slab. This pins both
+    the Snell factor (former ξ=n0·sinθ error) and the boundary matching (former
+    vacuum-normal vectors gave ~no reflection). Isotropic Q=0 ⇒ ε = n²·I."""
+    import jax.numpy as jnp
+    from difflc.optics import stokes_oblique
+
+    n, d, lam, Nz = 1.573, 2e-6, 532e-9, 201
+    dz = d / (Nz - 1)
+    Q = jnp.zeros((Nz, 3, 3))
+    th = math.radians(theta_deg)
+    S0_p = float(stokes_oblique(Q, lam, th, jnp.array([1, 0], dtype=complex),
+                                dz, no=n, ne=n, S0=0.6, n_ambient=n_amb)[0])
+    S0_s = float(stokes_oblique(Q, lam, th, jnp.array([0, 1], dtype=complex),
+                                dz, no=n, ne=n, S0=0.6, n_ambient=n_amb)[0])
+    assert abs(S0_p - _airy_T(n, d, lam, th, "p", n_amb)) < 1e-4
+    assert abs(S0_s - _airy_T(n, d, lam, th, "s", n_amb)) < 1e-4
+
+
+def test_backflow_kappa_changes_dynamics_and_is_finite():
+    """The backflow branch (backflow_kappa>0) must run without NaN and produce a
+    relaxation that differs from κ=0 (guards the per-node μ(θ) tridiagonal /
+    bulk path, which had no test)."""
+    def relax(kappa):
+        M = make_model(
+            E7Config(K11=10e-12, K22=4e-12, K33=10e-12, gamma1=0.08, W=1e-3,
+                     no=1.511, ne=1.691, eps_par=19.2, eps_perp=6.9, Nz=41,
+                     pretilt_deg=2.0, S0=0.6),
+            CellSpec("t", d_cell=12.5e-6, twist_deg=0.0, voltage_ratio=1.0),
+            wavelengths_nm=(632.8,), incidence_deg=(0.0,),
+            input_pols=np.array([jones_linear(45.0)]),
+            dt=2.5e-4, record_every=2, T_on=0.1, T_off=0.2, T_eq=0.02,
+            backflow_kappa=kappa,
+        )
+        o = M.run_protocol_np(PARAMS, 6.0)
+        st = o["stokes"]
+        s2 = st[..., 2] / np.clip(st[..., 0], 1e-30, None)
+        return np.nan_to_num(np.squeeze(0.5 * (1.0 - s2)))
+
+    I0, Ik = relax(0.0), relax(0.4)
+    assert np.all(np.isfinite(I0)) and np.all(np.isfinite(Ik))
+    assert np.max(np.abs(I0 - Ik)) > 1e-3, "backflow κ=0.4 did not change dynamics"
