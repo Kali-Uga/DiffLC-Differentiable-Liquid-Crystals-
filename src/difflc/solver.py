@@ -695,12 +695,18 @@ def make_model(
 
         Returns the same keys as ``run_protocol_np`` but with a leading voltage
         axis on ``stokes``/``diag``/``states`` (``time`` is shared). Equivalent
-        to looping ``run_protocol_np`` over ``V_array`` but ~n_V× faster."""
+        to looping ``run_protocol_np`` over ``V_array`` but ~n_V× faster on a
+        parallel backend (on CPU the total work is unchanged). Agreement with the
+        loop is exact on the same backend, ~1e-12 across backends (vmap floating-
+        point re-association)."""
+        V_arr = np.asarray(V_array, dtype=float).reshape(-1)
+        if V_arr.size == 0:
+            raise ValueError("run_protocols_np: V_array must be non-empty.")
         _stability_warn(params_K, float(dt_))
         n_on_b, n_off_b, n_eq_ = counts(T_on_, T_off_, dt_, T_eq_, rec_)
         t, st, diag_out, states = _protocol_multiV_jit(
             jnp.asarray(params_K, dtype=jnp.float64),
-            jnp.asarray(V_array, dtype=jnp.float64),
+            jnp.asarray(V_arr, dtype=jnp.float64),
             float(dt_),
             n_on_b,
             n_off_b,
@@ -713,7 +719,7 @@ def make_model(
             "stokes": np.asarray(st),           # (n_V, n_rec, n_wl, n_theta, n_pol, 4)
             "diag": np.asarray(diag_out),       # (n_V, n_rec, Nz, 4)
             "states": np.asarray(states),       # (n_V, n_rec, Nz, 5)
-            "V_abs": np.asarray(V_array, dtype=float),
+            "V_abs": V_arr,
             "z_um": np.asarray(z_axis) * 1e6,
             "cell": cell.name,
             "d_cell": d_cell,

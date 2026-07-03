@@ -3,19 +3,22 @@
 ## 0.3.1
 
 Gradient-safety and vectorisation pass (no change to the physics; the forward
-and Jacobian outputs are bit-for-bit identical to 0.3.0 — verified).
+and Jacobian outputs are unchanged — bit-for-bit on the same backend, ~1e-12
+across backends where `vmap` re-associates floating-point ops).
 
 ### Added
 - `model.run_protocols_np(params, V_array)` — batches a protocol over several
-  voltages in one `vmap` kernel (≈n_V× faster than looping `run_protocol_np`;
-  bit-for-bit identical). `model.stability_dt_max(params)` exposes the
+  voltages in one `vmap` kernel (≈n_V× faster than looping `run_protocol_np` on a
+  parallel backend; identical to the loop up to backend fp re-association).
+  `model.stability_dt_max(params)` exposes the
   explicit-stability limit.
 
 ### Changed
 - **Optics and angle diagnostics moved out of the time `scan`.** They depend
   only on the recorded states, so they are now batched with `vmap` after the
   scan instead of serialised inside it (far fewer sequential `expm` calls and
-  Jacobian tangents). Forward/Jacobian outputs unchanged to 0 ULP.
+  Jacobian tangents). Forward/Jacobian outputs unchanged (0 ULP on the same
+  backend; ~1e-12 across backends).
 - `angles_from_Q` (eigh) diagnostics wrapped in `stop_gradient` — output-only,
   and `eigh` has a singular JVP at degenerate eigenvalues; keeps them out of the
   `jacfwd` graph.
