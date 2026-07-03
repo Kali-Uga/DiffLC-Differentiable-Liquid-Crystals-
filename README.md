@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![JAX](https://img.shields.io/badge/JAX-blue?logo=jax&logoColor=white)](https://github.com/google/jax)
-[![CI](https://github.com/Kali-Uga/DiffLC-Differentiable-Liquid-Crystals-/actions/workflows/ci.yml/badge.svg)](https://github.com/Kali-Uga/DiffLC-Differentiable-Liquid-Crystals-/actions/workflows/ci.yml)
+[![CI](https://github.com/Kali-Uga/DiffLC-Differentiable-Liquid-Crystals/actions/workflows/ci.yml/badge.svg)](https://github.com/Kali-Uga/DiffLC-Differentiable-Liquid-Crystals/actions/workflows/ci.yml)
 
 **DiffLC** is a high-performance numerical engine designed for the simulation of nematic liquid crystal (LC) dynamics and the solution of complex inverse problems. Built on the **JAX** autograd engine, DiffLC treats the entire physical pipeline—from $Q$-tensor relaxation to Berreman 4×4 optics—as a differentiable operator.
 
@@ -29,8 +29,8 @@ The codebase is modularized to support both direct physical simulations and inte
 ## Installation
 
 ```bash
-git clone https://github.com/Kali-Uga/DiffLC-Differentiable-Liquid-Crystals-.git
-cd DiffLC-Differentiable-Liquid-Crystals-
+git clone https://github.com/Kali-Uga/DiffLC-Differentiable-Liquid-Crystals.git
+cd DiffLC-Differentiable-Liquid-Crystals
 pip install -e .
 ```
 
@@ -92,6 +92,6 @@ If you use this framework in your scientific work, please cite:
   title   = {DiffLC: Differentiable Landau-de Gennes Simulation Suite},
   year    = {2026},
   version = {0.3.0},
-  url     = {https://github.com/Kali-Uga/DiffLC-Differentiable-Liquid-Crystals-}
+  url     = {https://github.com/Kali-Uga/DiffLC-Differentiable-Liquid-Crystals}
 }
 ```

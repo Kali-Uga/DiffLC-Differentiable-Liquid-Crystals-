@@ -5,6 +5,6 @@ version: "0.3.0"
 authors:
   - family-names: "Krutoy"
     given-names: "Nikita"
-repository-code: "https://github.com/Kali-Uga/DiffLC-Differentiable-Liquid-Crystals-"
+repository-code: "https://github.com/Kali-Uga/DiffLC-Differentiable-Liquid-Crystals"
 license: MIT
 abstract: "Differentiable Landau-de Gennes simulation tools for nematic LC cells. JAX backend, Berreman optics, and multi-cell parameter recovery."
