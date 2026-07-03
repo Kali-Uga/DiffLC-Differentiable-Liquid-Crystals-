@@ -25,8 +25,8 @@ def eps_from_Q(Q, *, no: float, ne: float, S0: float):
 
     For uniaxial Q = S(nn − I/3):
         ε = no² I + Δn² nn = ε_iso I + (Δn²/S₀) Q
-    Eigenvalues are clipped to a positive physical interval to prevent
-    sqrt-of-negative issues during dynamics.
+    Returns the symmetric dielectric tensor directly (no eigenvalue clipping —
+    see the NOTE below on differentiability).
     """
     I3 = jnp.eye(3, dtype=jnp.float64)
     delta_n2 = ne**2 - no**2
@@ -147,7 +147,10 @@ def jones_layer_normal(
     k0_dz = 2.0 * math.pi / wavelength_m * dz * path_factor
     tr_half = 0.5 * (N[0, 0] + N[1, 1])
     B0 = N - tr_half * I2
-    r = jnp.sqrt(jnp.clip(B0[0, 0] ** 2 + B0[0, 1] ** 2, 0.0, None))
+    # Lower-clip strictly > 0: sqrt has an infinite derivative at 0, and r=0 is
+    # reached exactly for an in-plane-isotropic layer (exact homeotropic director),
+    # which would give a NaN autodiff tangent here (same trap as the removed eigh clip).
+    r = jnp.sqrt(jnp.clip(B0[0, 0] ** 2 + B0[0, 1] ** 2, 1e-30, None))
     x = k0_dz * r
     sin_over_r = k0_dz * jnp.sinc(x / jnp.pi)
     scalar = jnp.exp(1j * k0_dz * tr_half)

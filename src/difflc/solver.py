@@ -29,6 +29,11 @@ from .qtensor import (
 from .optics import all_stokes
 from .utils import E7Config, CellSpec, K_to_L
 
+# NOTE: importing difflc enables JAX 64-bit globally for this process. float64 is
+# required here — the fringe-sensitive Berreman phase and the scaling-and-squaring
+# in `expm` accumulate ~1e-3 error in float32, and the semi-implicit tangents lose
+# precision. This is a *global* JAX config mutation; if DiffLC is imported into a
+# process that deliberately runs float32 elsewhere, be aware it flips x64 on.
 jax.config.update("jax_enable_x64", True)
 
 # 5-component identity basis — used for analytic Jacobian of bulk term
@@ -451,6 +456,26 @@ def make_model(
             n_ambient=n_ambient,
         )
 
+    def _optics_and_diag(states):
+        """Batched optics + diagnostics over the recorded states.
+
+        ``states`` is (n_rec, Nz, 5). Optics and the angle diagnostics depend
+        only on the states, so they are computed once, *after* the time scan,
+        with ``vmap`` over the record axis instead of being serialised inside
+        the scan body — the same floating-point work in a batched kernel.
+
+        The eigenvalue diagnostics (``angles_from_Q`` → ``eigh``) are output-only
+        and ``eigh`` has a singular JVP at degenerate eigenvalues, so they are
+        wrapped in ``stop_gradient`` to keep them out of the ``jacfwd`` graph.
+        """
+        Q_stack = jax.vmap(v2Q)(states)                    # (n_rec, Nz, 3, 3)
+        stokes = jax.vmap(_all_stokes_fn)(Q_stack)
+        theta, phi, S_eff, beta = jax.vmap(angles_from_Q)(
+            lax.stop_gradient(Q_stack)
+        )
+        diag_out = jnp.stack([theta, phi, S_eff, beta], axis=-1)
+        return stokes, diag_out
+
     # --- inner protocol (JAX-purefunction, JIT-able) ---
 
     def _protocol_recorded(
@@ -476,18 +501,19 @@ def make_model(
                 return vn, None
 
             v_end, _ = lax.scan(body, v_curr, None, length=rec_every)
-            Q_end = v2Q(v_end)
-            st = _all_stokes_fn(Q_end)
-            theta, phi, S_eff, beta = angles_from_Q(Q_end)
-            diag_out = jnp.stack([theta, phi, S_eff, beta], axis=-1)
-            return v_end, (st, diag_out, v_end)
+            return v_end, v_end
 
         E_on = V_abs / d_cell
         Es_on = jnp.full((n_on_blocks,), E_on, dtype=jnp.float64)
         Es_off = jnp.zeros((n_off_blocks,), dtype=jnp.float64)
         Es_all = jnp.concatenate([Es_on, Es_off])
 
-        v, (stokes, diag_out, states) = lax.scan(one_record_block, v, Es_all)
+        # The scan only advances the state; optics and diagnostics depend solely
+        # on the recorded states, so they are batched *after* the scan (vmap)
+        # rather than serialised inside its body. Bit-for-bit identical to the
+        # in-scan version, but far fewer sequential expm calls (and tangents).
+        v, states = lax.scan(one_record_block, v, Es_all)
+        stokes, diag_out = _optics_and_diag(states)
         n_rec = n_on_blocks + n_off_blocks
         time_axis = (jnp.arange(n_rec, dtype=jnp.float64) + 1.0) * dt_val * rec_every
         return time_axis, stokes, diag_out, states
@@ -514,13 +540,10 @@ def make_model(
                 ), None
 
             v_end, _ = lax.scan(body, v_curr, None, length=rec_every)
-            Q_end = v2Q(v_end)
-            st = _all_stokes_fn(Q_end)
-            theta, phi, S_eff, beta = angles_from_Q(Q_end)
-            diag_out = jnp.stack([theta, phi, S_eff, beta], axis=-1)
-            return v_end, (st, diag_out, v_end)
+            return v_end, v_end
 
-        v, (stokes, diag_out, states) = lax.scan(one_block, v, V_blocks_abs)
+        v, states = lax.scan(one_block, v, V_blocks_abs)
+        stokes, diag_out = _optics_and_diag(states)
         n_rec = V_blocks_abs.shape[0]
         time_axis = (jnp.arange(n_rec, dtype=jnp.float64) + 1.0) * dt_val * rec_every
         return time_axis, stokes, diag_out, states
@@ -562,6 +585,26 @@ def make_model(
         static_argnames=("n_on_blocks", "n_off_blocks", "n_eq", "rec_every"),
     )
 
+    def _protocol_multiV(
+        params_K, V_array, dt_val, n_on_blocks, n_off_blocks, n_eq, rec_every, pretilt_rad
+    ):
+        """Same protocol at several voltages, batched with ``vmap`` over V.
+
+        The cell geometry is identical across voltages, so this replaces a Python
+        loop over ``run_protocol_np`` with a single batched kernel (~n_V× faster,
+        e.g. for profile-likelihood / multi-V fits). Bit-for-bit identical."""
+        def one_V(V):
+            return _protocol_recorded(
+                params_K, V, dt_val, n_on_blocks, n_off_blocks, n_eq, rec_every, pretilt_rad
+            )
+
+        return jax.vmap(one_V)(V_array)
+
+    _protocol_multiV_jit = jax.jit(
+        _protocol_multiV,
+        static_argnames=("n_on_blocks", "n_off_blocks", "n_eq", "rec_every"),
+    )
+
     # --- count helper ---
     def counts(T_on_=T_on, T_off_=T_off, dt_=dt, T_eq_=T_eq, rec_=record_every):
         n_on = int(round(T_on_ / dt_))
@@ -575,30 +618,34 @@ def make_model(
     import numpy as np
     import warnings as _warnings
 
-    def _stability_warn(params_K, dt_):
-        """Warn if dt exceeds the explicit-stability limit of the L2/L3 terms.
+    def stability_dt_max(params_K):
+        """Explicit-stability limit dt ≲ dz²/(μ·max|L2,L3|) for the L2/L3 terms.
 
-        L1 + anchoring are integrated implicitly (Thomas), but L2 and L3 (the
-        latter carries the bend constant K33) are explicit, so the scheme is
-        only conditionally stable: dt ≲ dz² / (μ · max|L2, L3|). Refining the
-        spatial grid (larger Nz, smaller dz) tightens this limit; exceeding it
-        silently produces NaN / blow-up. This guard makes that condition visible.
-        """
+        L1 + anchoring are implicit (Thomas), but L2/L3 (the latter carries K33)
+        are explicit → only conditionally stable. Returns +inf if L2=L3=0."""
         K11, K22, K33, gamma1, W = [float(x) for x in params_K]
         _, L2, L3 = K_to_L(K11, K22, K33, S0)
         mu = 2.0 * S0**2 / gamma1  # 1/γ_Q, γ_Q = γ1/(2S0²)
         Leff = max(abs(L2), abs(L3))
-        if Leff > 0.0:
-            dt_max = dz**2 / (mu * Leff)
-            if dt_ > dt_max:
-                _warnings.warn(
-                    f"dt={dt_:.2e}s exceeds explicit-stability limit "
-                    f"~{dt_max:.2e}s (Nz={Nz}, dz={dz:.2e}m): L2/L3 are explicit, "
-                    f"so a larger dt risks NaN/blow-up. Reduce dt or Nz "
-                    f"(or refine both together).",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+        return float(dz**2 / (mu * Leff)) if Leff > 0.0 else float("inf")
+
+    def _stability_warn(params_K, dt_):
+        """Emit a RuntimeWarning if dt exceeds the explicit-stability limit.
+
+        Exceeding it silently produces NaN / blow-up; this guard makes the
+        condition visible. (In a fitting context prefer a hard failure — see
+        ``solve_inverse(strict_stability=...)``, which uses ``stability_dt_max``.)
+        """
+        dt_max = stability_dt_max(params_K)
+        if dt_ > dt_max:
+            _warnings.warn(
+                f"dt={dt_:.2e}s exceeds explicit-stability limit "
+                f"~{dt_max:.2e}s (Nz={Nz}, dz={dz:.2e}m): L2/L3 are explicit, "
+                f"so a larger dt risks NaN/blow-up. Reduce dt or Nz "
+                f"(or refine both together).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def run_protocol_np(
         params_K,
@@ -628,6 +675,45 @@ def make_model(
             "stokes": np.asarray(st),
             "diag": np.asarray(diag_out),
             "states": np.asarray(states),
+            "z_um": np.asarray(z_axis) * 1e6,
+            "cell": cell.name,
+            "d_cell": d_cell,
+        }
+
+    def run_protocols_np(
+        params_K,
+        V_array,
+        *,
+        dt_=dt,
+        T_on_=T_on,
+        T_off_=T_off,
+        T_eq_=T_eq,
+        rec_=record_every,
+        pretilt_deg=cfg.pretilt_deg,
+    ):
+        """Batched ``run_protocol_np`` over an array of voltages (single kernel).
+
+        Returns the same keys as ``run_protocol_np`` but with a leading voltage
+        axis on ``stokes``/``diag``/``states`` (``time`` is shared). Equivalent
+        to looping ``run_protocol_np`` over ``V_array`` but ~n_V× faster."""
+        _stability_warn(params_K, float(dt_))
+        n_on_b, n_off_b, n_eq_ = counts(T_on_, T_off_, dt_, T_eq_, rec_)
+        t, st, diag_out, states = _protocol_multiV_jit(
+            jnp.asarray(params_K, dtype=jnp.float64),
+            jnp.asarray(V_array, dtype=jnp.float64),
+            float(dt_),
+            n_on_b,
+            n_off_b,
+            n_eq_,
+            int(rec_),
+            float(math.radians(pretilt_deg)),
+        )
+        return {
+            "time": np.asarray(t[0]),           # identical across voltages
+            "stokes": np.asarray(st),           # (n_V, n_rec, n_wl, n_theta, n_pol, 4)
+            "diag": np.asarray(diag_out),       # (n_V, n_rec, Nz, 4)
+            "states": np.asarray(states),       # (n_V, n_rec, Nz, 5)
+            "V_abs": np.asarray(V_array, dtype=float),
             "z_um": np.asarray(z_axis) * 1e6,
             "cell": cell.name,
             "d_cell": d_cell,
@@ -722,6 +808,8 @@ def make_model(
         dz=dz,
         z_um=np.asarray(z_axis) * 1e6,
         run_protocol_np=run_protocol_np,
+        run_protocols_np=run_protocols_np,
+        stability_dt_max=stability_dt_max,
         run_waveform_np=run_waveform_np,
         signal_logparams_np=signal_logparams_np,
         jac_signal_logparams_np=jac_signal_logparams_np,
