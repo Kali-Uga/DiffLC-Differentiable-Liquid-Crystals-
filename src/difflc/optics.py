@@ -223,7 +223,14 @@ def stokes_oblique(
 def stokes_normal(
     Q_field, wavelength_m, input_pol, dz, *, no: float, ne: float, S0: float
 ):
-    """Normal-incidence Stokes via Jones chain (faster than Berreman)."""
+    """Normal-incidence Stokes via a pure Jones propagation chain.
+
+    NOTE (v0.3.0): this is a **retardation-only** path — it propagates through the
+    LC layers but does NOT model the entrance/exit interfaces. It therefore
+    **diverges from** ``stokes_oblique(θ=0)``, which now includes Fresnel boundary
+    matching (see that function's ``n_ambient``). Use this only when you explicitly
+    want the interface-free retardation; ``make_model`` uses the Berreman path.
+    """
     Q_mid = 0.5 * (Q_field[:-1] + Q_field[1:])
 
     def mul(M, Ql):
