@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.3.1
+
+Gradient-safety and vectorisation pass (no change to the physics; the forward
+and Jacobian outputs are unchanged — bit-for-bit on the same backend, ~1e-12
+across backends where `vmap` re-associates floating-point ops).
+
+### Added
+- `model.run_protocols_np(params, V_array)` — batches a protocol over several
+  voltages in one `vmap` kernel (≈n_V× faster than looping `run_protocol_np` on a
+  parallel backend; matches the loop to ~1e-7 across backends — the whole
+  trajectory is re-associated in the batched kernel and accumulates over the
+  relaxation). `model.stability_dt_max(params)` exposes the
+  explicit-stability limit.
+
+### Changed
+- **Optics and angle diagnostics moved out of the time `scan`.** They depend
+  only on the recorded states, so they are now batched with `vmap` after the
+  scan instead of serialised inside it (far fewer sequential `expm` calls and
+  Jacobian tangents). Forward/Jacobian outputs unchanged (0 ULP on the same
+  backend; ~1e-12 across backends).
+- `angles_from_Q` (eigh) diagnostics wrapped in `stop_gradient` — output-only,
+  and `eigh` has a singular JVP at degenerate eigenvalues; keeps them out of the
+  `jacfwd` graph.
+- `solve_inverse` defaults: `x_scale="jac"` (was `1.0`, which stalls on the
+  ill-conditioned fringe Jacobian) and `strict_stability=True` (raise instead of
+  silently fitting NaN-masked residuals when `dt` exceeds the stability limit);
+  `loss`/`xtol`/`ftol`/`gtol` are now arguments. Residual/Jacobian failures warn
+  instead of masking to 1e6 silently.
+
+### Fixed
+- `jones_layer_normal`: sqrt argument lower-clipped to 1e-30 (was 0.0) — removes
+  a NaN autodiff tangent at the exact homeotropic (in-plane isotropic) layer.
+- `eps_from_Q` docstring no longer claims eigenvalue clipping (removed in 0.3.0).
+- Documented that importing DiffLC flips JAX to float64 globally.
+
 ## 0.3.0
 
 Physics/optics correctness pass (see `tests/test_physics.py`).
@@ -14,7 +49,8 @@ Physics/optics correctness pass (see `tests/test_physics.py`).
 - **Boundary matching now models Fresnel reflection** with a bounding medium index.
   `make_model`, `all_stokes`, `stokes_oblique` gain `n_ambient` (default **1.0 = air**).
   The old code was effectively index-matched (no reflection); the new default changes
-  the normalised Stokes at θ=0 by up to ~0.03. **Glass-clad cells should pass
+  the normalised Stokes at θ=0 by up to ~0.03–0.08 depending on cell geometry
+  (≈0.03 in ΔI on a 12.5 µm cell, up to ~0.08 in ΔS2 on a thin plate). **Glass-clad cells should pass
   `n_ambient≈1.52`.** Synthetic data / FIM / fits generated before 0.3.0 are not
   directly comparable.
 - **Rotational-viscosity mapping fixed:** μ = 1/γ_Q = **2·S0²/γ1** (was S0/γ1). The old

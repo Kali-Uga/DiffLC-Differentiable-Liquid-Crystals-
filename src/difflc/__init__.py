@@ -75,7 +75,7 @@ from .inverse import (
     PARAM_UNITS,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     # config

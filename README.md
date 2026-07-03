@@ -91,7 +91,7 @@ If you use this framework in your scientific work, please cite:
   author  = {Krutoy, Nikita},
   title   = {DiffLC: Differentiable Landau-de Gennes Simulation Suite},
   year    = {2026},
-  version = {0.3.0},
+  version = {0.3.1},
   url     = {https://github.com/Kali-Uga/DiffLC-Differentiable-Liquid-Crystals}
 }
 ```

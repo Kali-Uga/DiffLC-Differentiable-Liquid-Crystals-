@@ -270,3 +270,76 @@ def test_backflow_kappa_changes_dynamics_and_is_finite():
     I0, Ik = relax(0.0), relax(0.4)
     assert np.all(np.isfinite(I0)) and np.all(np.isfinite(Ik))
     assert np.max(np.abs(I0 - Ik)) > 1e-3, "backflow κ=0.4 did not change dynamics"
+
+
+# ---------------------------------------------------------------------------
+# R&D iteration 5: gradient safety + vectorisation
+# ---------------------------------------------------------------------------
+
+
+def test_jones_normal_grad_finite_at_homeotropic():
+    """jones_layer_normal must have a finite autodiff gradient at the exact
+    homeotropic director, where the in-plane dielectric tensor is isotropic and
+    the internal sqrt argument hits 0 (the 1e-30 lower clip removes the NaN)."""
+    import jax
+    import jax.numpy as jnp
+    from difflc.optics import jones_layer_normal
+
+    S0, no, ne = 0.6, 1.511, 1.691
+
+    def scalar(theta):
+        n = jnp.array([jnp.cos(theta), 0.0, jnp.sin(theta)])
+        Q = S0 * (jnp.outer(n, n) - jnp.eye(3) / 3.0)
+        M = jones_layer_normal(Q, 632.8e-9, 3e-7, no=no, ne=ne, S0=S0)
+        return jnp.sum(jnp.abs(M) ** 2)
+
+    g = jax.grad(scalar)(jnp.array(jnp.pi / 2))   # exact homeotropic
+    assert jnp.isfinite(g)
+
+
+def test_run_protocols_batch_matches_loop():
+    """run_protocols_np (vmap over V) must match looping run_protocol_np. It is
+    exact on a single backend, but XLA re-associates the batched reductions
+    (non-deterministically across runs), and that ~1e-15/step noise accumulates
+    over the relaxation and is amplified by the fringe-sensitive optics — observed
+    up to ~1e-7 on JAX 0.10 / numpy 2. Assert numerical equivalence (< 1e-5, still
+    5+ orders below any wiring bug, which would give O(1) differences), not
+    bit-equality. Also exercises the optics-out-of-scan refactor and empty guard."""
+    cfg = E7Config(K11=10e-12, K22=4e-12, K33=12e-12, gamma1=0.09, W=1e-3,
+                   no=1.511, ne=1.691, eps_par=19.2, eps_perp=6.9, Nz=41,
+                   pretilt_deg=2.5, S0=0.6)
+    M = make_model(cfg, CellSpec("c", d_cell=12.5e-6, twist_deg=0.0, voltage_ratio=1.0),
+                   wavelengths_nm=(632.8,), incidence_deg=(0.0,),
+                   input_pols=np.array([jones_linear(45.0)]),
+                   dt=2.5e-4, record_every=2, T_on=0.05, T_off=0.05, T_eq=0.02,
+                   poisson=True, n_ambient=1.52)
+    P = np.array([10e-12, 4e-12, 12e-12, 0.09, 1e-3])
+    Vs = [3.5, 5.0, 7.0]
+    batch = M.run_protocols_np(P, Vs)
+    for i, V in enumerate(Vs):
+        one = M.run_protocol_np(P, V)
+        assert np.max(np.abs(batch["stokes"][i] - one["stokes"])) < 1e-5
+        assert np.max(np.abs(batch["diag"][i] - one["diag"])) < 1e-5
+    assert np.all(np.isfinite(batch["stokes"]))
+    with pytest.raises(ValueError):
+        M.run_protocols_np(P, [])
+
+
+def test_solve_inverse_strict_stability_raises():
+    """solve_inverse(strict_stability=True) must fail fast when dt exceeds the
+    explicit-stability limit, instead of silently fitting masked-1e6 residuals."""
+    from types import SimpleNamespace
+    from difflc.inverse import solve_inverse
+
+    cfg = E7Config(K11=10e-12, K22=4e-12, K33=16e-12, gamma1=0.08, W=1e-3,
+                   no=1.511, ne=1.691, eps_par=19.2, eps_perp=6.9, Nz=81,
+                   pretilt_deg=2.0, S0=0.6)
+    M = make_model(cfg, CellSpec("t", d_cell=12.5e-6, twist_deg=0.0, voltage_ratio=1.0),
+                   wavelengths_nm=(632.8,), incidence_deg=(0.0,),
+                   input_pols=np.array([jones_linear(45.0)]))
+    proto = SimpleNamespace(name="t", V_abs=5.0)
+    p_true = np.array([10e-12, 4e-12, 16e-12, 0.08, 1e-3])
+    # Nz=81 with the coarse default dt=2.5e-4 is above the explicit-stability limit.
+    with pytest.raises(ValueError, match="stability"):
+        solve_inverse({"t": M}, [proto], np.zeros(10), p_true, 0.01,
+                      dt=2.5e-4, T_on=0.05, T_off=0.05, T_eq=0.02, record_every=2)

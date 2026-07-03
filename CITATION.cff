@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use DiffLC, please cite it as a software package."
 title: "DiffLC"
-version: "0.3.0"
+version: "0.3.1"
 authors:
   - family-names: "Krutoy"
     given-names: "Nikita"

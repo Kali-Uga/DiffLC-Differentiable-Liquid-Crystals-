@@ -7,6 +7,7 @@ Supports multiple random starts and JAX or finite-difference Jacobians.
 
 from __future__ import annotations
 
+import warnings
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -52,8 +53,22 @@ def _build_residual(
     def residual_np(lp_np):
         try:
             res = (signal_all(lp_np) - target_flat) / noise_std
-            return np.nan_to_num(res, nan=1e6, posinf=1e6, neginf=-1e6)
-        except Exception:
+            if not np.all(np.isfinite(res)):
+                # Non-finite signal (typically explicit-L2/L3 blow-up or a bad
+                # region). We still return a large finite residual so TRF can back
+                # out, but do NOT do it silently — silent 1e6 plateaus look like
+                # convergence stalls. See solve_inverse(strict_stability=...).
+                warnings.warn(
+                    f"non-finite residual at log10(params)={np.round(lp_np, 3)} "
+                    "→ masked to 1e6 (check dt/Nz stability or bounds).",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                res = np.nan_to_num(res, nan=1e6, posinf=1e6, neginf=-1e6)
+            return res
+        except Exception as exc:
+            warnings.warn(f"residual evaluation failed → masked to 1e6: {exc}",
+                          RuntimeWarning, stacklevel=2)
             return np.full_like(target_flat, 1e6, dtype=float)
 
     if jac_mode == "jax":
@@ -80,7 +95,9 @@ def _build_residual(
                     -MAX_JAC,
                     MAX_JAC,
                 )
-            except Exception:
+            except Exception as exc:
+                warnings.warn(f"Jacobian evaluation failed → zero matrix: {exc}",
+                              RuntimeWarning, stacklevel=2)
                 return np.zeros((target_flat.size, n_params), dtype=float)
     else:
 
@@ -117,6 +134,12 @@ def solve_inverse(
     first_start_radius=0.15,
     random_start_radius=0.15,
     seed=42,
+    x_scale="jac",
+    loss="linear",
+    xtol=1e-8,
+    ftol=1e-8,
+    gtol=1e-8,
+    strict_stability=True,
 ):
     """Multi-start TRF inverse recovery.
 
@@ -129,6 +152,11 @@ def solve_inverse(
     noise_std    : float
     n_starts     : number of optimisation starts
     jac_mode     : "jax" or "fd"
+    x_scale      : TRF variable scaling, default "jac" (recommended for the
+                   ill-conditioned fringe Jacobian; the old 1.0 stalls).
+    loss         : scipy loss, default "linear"; use "soft_l1" for robustness.
+    strict_stability : if True (default), raise instead of silently fitting NaN
+                   when dt exceeds the explicit-stability limit at p_true.
 
     Returns
     -------
@@ -138,6 +166,22 @@ def solve_inverse(
     log_true = np.log10(np.asarray(p_true, dtype=float))
     LOG_LO = log_true - 1.0
     LOG_HI = log_true + 1.0
+
+    # Fail fast in the fitting context: an unstable (dt, Nz) turns every residual
+    # into masked 1e6, which looks like a stalled optimiser. Forward runs keep the
+    # softer RuntimeWarning; here we raise. (Set strict_stability=False to opt out.)
+    if strict_stability:
+        p_true_arr = np.asarray(p_true, dtype=float)
+        for p in protocols:
+            m = models[p.name]
+            get_lim = getattr(m, "stability_dt_max", None)
+            if get_lim is not None and dt > get_lim(p_true_arr):
+                raise ValueError(
+                    f"dt={dt:.2e}s exceeds the explicit-stability limit "
+                    f"~{get_lim(p_true_arr):.2e}s for cell '{p.name}' at p_true; "
+                    "the fit would evaluate NaN residuals. Reduce dt (or Nz), or "
+                    "pass strict_stability=False to proceed anyway."
+                )
 
     rng = np.random.default_rng(seed)
 
@@ -176,12 +220,12 @@ def solve_inverse(
                 jac=jac_np,
                 method="trf",
                 bounds=(LOG_LO, LOG_HI),
-                xtol=1e-8,
-                ftol=1e-8,
-                gtol=1e-8,
+                xtol=xtol,
+                ftol=ftol,
+                gtol=gtol,
                 max_nfev=max_nfev,
-                x_scale=1.0,
-                loss="linear",
+                x_scale=x_scale,
+                loss=loss,
             )
             cost = float(result.cost)
             all_results.append({"start": i_start, "result": result, "cost": cost})
