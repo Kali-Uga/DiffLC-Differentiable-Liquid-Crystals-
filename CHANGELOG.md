@@ -9,8 +9,9 @@ across backends where `vmap` re-associates floating-point ops).
 ### Added
 - `model.run_protocols_np(params, V_array)` — batches a protocol over several
   voltages in one `vmap` kernel (≈n_V× faster than looping `run_protocol_np` on a
-  parallel backend; identical to the loop up to backend fp re-association).
-  `model.stability_dt_max(params)` exposes the
+  parallel backend; matches the loop to ~1e-7 across backends — the whole
+  trajectory is re-associated in the batched kernel and accumulates over the
+  relaxation). `model.stability_dt_max(params)` exposes the
   explicit-stability limit.
 
 ### Changed
