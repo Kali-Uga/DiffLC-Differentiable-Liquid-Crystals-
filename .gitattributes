@@ -1,0 +1,3 @@
+# Notebooks are documentation/demos, not the library — keep them out of the
+# GitHub language statistics so the repo reads as a Python package.
+*.ipynb linguist-documentation
